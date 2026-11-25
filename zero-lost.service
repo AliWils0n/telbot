@@ -1,0 +1,19 @@
+[Unit]
+Description=Zero Lost Telegram publisher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=zero-lost
+UMask=0077
+WorkingDirectory=/opt/zero-lost
+EnvironmentFile=/etc/zero-lost.env
+ExecStart=/opt/zero-lost/.venv/bin/python /opt/zero-lost/bot.py
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
