@@ -1,5 +1,6 @@
 import copy
 import html
+import io
 import json
 import logging
 import os
@@ -90,7 +91,17 @@ def tick(store, publisher, control):
         if not store.change(claim):
             continue
         try:
-            publisher.send_message(channel_id(job["target"]), job["body"], disable_web_page_preview=True)
+            target = channel_id(job["target"])
+            photo = job.get("photo")
+            if not photo:
+                publisher.send_message(target, job["body"], disable_web_page_preview=True)
+            elif control.token == publisher.token:
+                publisher.send_photo(target, photo, caption=job["body"] or None)
+            else:
+                remote = control.get_file(photo)
+                with io.BytesIO(control.download_file(remote.file_path)) as upload:
+                    upload.name = "photo.jpg"
+                    publisher.send_photo(target, upload, caption=job["body"] or None)
         except Exception as error:
             log.warning("Scheduled post %s failed (%s)", key, type(error).__name__)
             def failed(data):
@@ -142,8 +153,10 @@ def attach(control, store):
         show(text, buttons)
 
     def handle(message):
-        text = message.text.strip()
+        text = (message.text or "").strip()
         step = state.get("step")
+        if message.content_type == "photo" and step != "body":
+            return control.send_message(OWNER, "عکس را بعد از انتخاب «پیام جدید» و کانال مقصد بفرست.")
         data = store.snapshot()
         if text in (HOME, "/panel", "/start", "/cancel"):
             return menu()
@@ -157,7 +170,7 @@ def attach(control, store):
             if text == TEMPLATE:
                 return prompt("field", "بخش مورد نظر را انتخاب کن.", list(FIELDS))
             if text == SCHEDULE:
-                return prompt("target", "این پیام متنی به کدام کانال برود؟", data["targets"])
+                return prompt("target", "پیام به کدام کانال برود؟", data["targets"])
             if text == JOBS:
                 jobs = data["jobs"]
                 if not jobs:
@@ -166,7 +179,8 @@ def attach(control, store):
                 for key, job in jobs.items():
                     status = {"ready": "فعال", "sending": "ارسال نامشخص", "failed": "ناموفق"}[job["status"]]
                     repeat = "روزانه" if job["clock"] else "یک‌بار"
-                    lines.append(f"#{key} · {job['target']} · {repeat} · {display_time(job['due'])} · {status}\n{job['body'][:32]}")
+                    label = "📷 " if job.get("photo") else ""
+                    lines.append(f"#{key} · {job['target']} · {repeat} · {display_time(job['due'])} · {status}\n{label}{job['body'][:32]}")
                 return prompt("delete_job", "\n".join(lines) + "\nبرای حذف، شمارهٔ برنامه را انتخاب کن.", list(jobs))
             return menu()
         if step == "minutes":
@@ -222,9 +236,16 @@ def attach(control, store):
             if text not in data["targets"]:
                 raise ValueError("یکی از مقصدهای فهرست را انتخاب کن.")
             state["target"] = text
-            return prompt("body", "متن پیامی که باید منتشر شود را بفرست.")
+            return prompt("body", "متن یا یک عکس بفرست. اگر کپشن می‌خواهی، موقع ارسال عکس زیرش بنویس.")
         if step == "body":
-            if not text or len(text.encode("utf-16-le")) // 2 > 4000:
+            if message.content_type == "photo":
+                if message.media_group_id:
+                    raise ValueError("فقط یک عکس بفرست، نه آلبوم.")
+                text = message.caption or ""
+                if len(text) > 1024:
+                    raise ValueError("کپشن طولانی است؛ عکس را با کپشن کوتاه‌تر بفرست.")
+                state["photo"] = max(message.photo, key=lambda size: size.width * size.height).file_id
+            elif not text or len(text.encode("utf-16-le")) // 2 > 4000:
                 raise ValueError("متن باید بین ۱ تا ۴۰۰۰ کاراکتر باشد.")
             state["body"] = text
             return prompt("mode", "چه زمانی فرستاده شود؟", [NOW, LATER, DAILY])
@@ -257,6 +278,8 @@ def attach(control, store):
                 now = time.time()
                 due = next_daily(state["clock"], now) if state["clock"] else now + state["delay"]
                 settings["jobs"][key] = dict(target=state["target"], body=state["body"], due=due, clock=state["clock"], status="ready")
+                if "photo" in state:
+                    settings["jobs"][key]["photo"] = state["photo"]
                 return key
             return menu("برنامه ثبت شد: #" + store.change(add))
         elif step == "delete_job":
@@ -270,9 +293,10 @@ def attach(control, store):
             store.change(lambda settings: settings["jobs"].pop(state["key"], None))
             return menu("برنامه لغو شد.")
         when = state["clock"] or (f"{state['delay']//60} دقیقه بعد از تأیید" if state["delay"] else "بعد از تأیید")
-        return prompt("confirm", f"مقصد: {state['target']}\n{state['mode']} · {when} (تهران)\n\n{state['body'][:500]}\n\nثبت شود؟", [CONFIRM])
+        label = "📷 عکس\n" if "photo" in state else ""
+        return prompt("confirm", f"مقصد: {state['target']}\n{state['mode']} · {when} (تهران)\n\n{label}{state['body'][:500]}\n\nثبت شود؟", [CONFIRM])
 
-    @control.message_handler(func=lambda message: message.chat.type == "private" and message.from_user is not None and message.from_user.id == OWNER and message.chat.id == OWNER, content_types=["text"])
+    @control.message_handler(func=lambda message: message.chat.type == "private" and message.from_user is not None and message.from_user.id == OWNER and message.chat.id == OWNER, content_types=["text", "photo"])
     def owner_message(message):
         try:
             handle(message)
