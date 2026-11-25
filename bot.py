@@ -30,8 +30,9 @@ def channel_settings():
 RECYCLE_HOURS = 4
 CONNECT_TIMEOUT = 5
 MAX_MESSAGE_LENGTH = 4000
-TARGET_CONFIGS = 16
-TARGET_PROXIES = 6
+POST_INTERVAL_SECONDS = 600
+TARGET_CONFIGS = 8
+TARGET_PROXIES = 3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("zero-lost")
@@ -340,7 +341,7 @@ def collect_github():
             if res: pool += res
     return list(dict.fromkeys(pool))
 
-def collect_valid_proxies(seen, now, max_needed=6):
+def collect_valid_proxies(seen, now, max_needed=TARGET_PROXIES):
     pool = []
     with ThreadPoolExecutor(max_workers=10) as ex:
         for res in ex.map(fetch_telegram_proxies, PROXY_TG_SOURCES):
@@ -392,85 +393,65 @@ def process_candidates(candidates, valid_items, max_needed):
             if len(valid_items) >= max_needed: break
     return valid_items
 
-if __name__ == "__main__":
-    token = os.environ.get("9157315056:AAF32NheR7kYSbl8f6Ja03ifS6cK0w10WYs", "").strip()
-    if not token:
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN before starting Zero Lost.")
-    bot = telebot.TeleBot(token, threaded=False)
-    CHANNELS = [channel_settings()]
-    DATA_DIR.mkdir(mode=0o700, exist_ok=True)
-    log.info("Zero Lost started")
+def prepare_post(seen, channel):
+    now = time.time()
+    valid_items = []
+
+    # --- مرحله اول: جستجوی کانفیگ در تلگرام ---
+    log.info("Collecting configs from Telegram...")
+    tg_cfgs = collect_telegram()
+    random.shuffle(tg_cfgs)
+    tg_candidates = [c for c in tg_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
+
+    valid_items = process_candidates(tg_candidates, valid_items, TARGET_CONFIGS)
+
+    # --- مرحله دوم: تکمیل ظرفیت کانفیگ از گیت‌هاب و لینک‌های ساب ---
+    if len(valid_items) < TARGET_CONFIGS:
+        needed = TARGET_CONFIGS - len(valid_items)
+        log.info(f"Need {needed} more configs. Fetching from GitHub...")
+        gh_cfgs = collect_github()
+        random.shuffle(gh_cfgs)
+        gh_candidates = [c for c in gh_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
+
+        valid_items = process_candidates(gh_candidates, valid_items, TARGET_CONFIGS)
+    post_text, used_keys = build_pack_post(valid_items, channel)
+    if not used_keys:
+        return None
+    proxies = collect_valid_proxies(seen, now, TARGET_PROXIES)
+    return post_text, build_keyboard(proxies, channel["url"]), [*used_keys, *(url for url, _ in proxies)]
+
+
+def run_publisher(bot, channel):
+    next_slot = time.monotonic()
     while True:
         try:
             seen = load_seen()
-            now = time.time()
-            valid_items = []
-            
-            # --- مرحله اول: جستجوی کانفیگ در تلگرام ---
-            log.info("Collecting configs from Telegram...")
-            tg_cfgs = collect_telegram()
-            random.shuffle(tg_cfgs)
-            tg_candidates = [c for c in tg_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
-            
-            valid_items = process_candidates(tg_candidates, valid_items, TARGET_CONFIGS)
-            
-            # --- مرحله دوم: تکمیل ظرفیت کانفیگ از گیت‌هاب و لینک‌های ساب ---
-            if len(valid_items) < TARGET_CONFIGS:
-                needed = TARGET_CONFIGS - len(valid_items)
-                log.info(f"Need {needed} more configs. Fetching from GitHub...")
-                gh_cfgs = collect_github()
-                random.shuffle(gh_cfgs)
-                gh_candidates = [c for c in gh_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
-                
-                valid_items = process_candidates(gh_candidates, valid_items, TARGET_CONFIGS)
-
-            # --- مرحله سوم: جمع‌آوری و تست پروکسی‌های تلگرام ---
-            log.info("Collecting MTProto proxies...")
-            valid_proxies = collect_valid_proxies(seen, now, TARGET_PROXIES)
-
-            # --- ساخت و ارسال ۲ پست (با فاصله ۵ تا ۱۰ ثانیه) ---
-            if valid_items:
-                packs = [
-                    (valid_items[:8], valid_proxies[:3]),
-                    (valid_items[8:16], valid_proxies[3:6])
-                ]
-                
-                for ch in CHANNELS:
-                    sent_count = 0
-                    for p_idx, (pack_cfgs, pack_proxies) in enumerate(packs):
-                        if not pack_cfgs:
-                            continue
-                        if p_idx > 0 and sent_count > 0:
-                            gap = random.uniform(5, 10)
-                            log.info(f"Waiting {gap:.1f}s before sending 2nd post to {ch['id']}...")
-                            time.sleep(gap)
-                            
-                        post_text, used_keys = build_pack_post(pack_cfgs, ch)
-                        if post_text and used_keys:
-                            try:
-                                keyboard = build_keyboard(pack_proxies, ch["url"])
-                                bot.send_message(
-                                    ch["id"], 
-                                    post_text, 
-                                    parse_mode="HTML", 
-                                    disable_web_page_preview=True,
-                                    reply_markup=keyboard
-                                )
-                                sent_count += 1
-                                for key in [*used_keys, *(url for url, _ in pack_proxies)]:
-                                    seen[key] = time.time()
-                                log.info(f"Sent post #{p_idx+1} to {ch['id']} ({len(used_keys)} configs, {len(pack_proxies)} proxies)")
-                            except Exception as e:
-                                log.error("Telegram send failed (%s)", type(e).__name__)
-                            else:
-                                save_seen(seen)
-                    time.sleep(2)
-                
+            last_sent = max(seen.values(), default=0)
+            remaining = min(POST_INTERVAL_SECONDS, max(0, last_sent + POST_INTERVAL_SECONDS - time.time()))
+            next_slot = max(next_slot, time.monotonic() + remaining)
+            post = prepare_post(seen, channel)
+            time.sleep(max(0, next_slot - time.monotonic()))
+            if post:
+                text, keyboard, keys = post
+                bot.send_message(channel["id"], text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=keyboard)
+                sent_at = time.time()
+                seen.update(dict.fromkeys(keys, sent_at))
+                save_seen(seen)
+                log.info("Sent one post to %s", channel["id"])
+            else:
+                log.info("No eligible configs; skipping this slot")
+        except Exception as error:
+            log.error("Round failed (%s)", type(error).__name__)
+            time.sleep(max(0, next_slot - time.monotonic()))
+        next_slot = time.monotonic() + POST_INTERVAL_SECONDS
 
 
-            log.info("Waiting 10 minutes...")
-            time.sleep(600) 
-            
-        except Exception as e:
-            log.error("Round failed (%s)", type(e).__name__)
-            time.sleep(60)
+if __name__ == "__main__":
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN before starting Zero Lost.")
+    bot = telebot.TeleBot(token, threaded=False)
+    channel = channel_settings()
+    DATA_DIR.mkdir(mode=0o700, exist_ok=True)
+    log.info("Zero Lost started")
+    run_publisher(bot, channel)
