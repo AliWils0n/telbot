@@ -30,9 +30,8 @@ def channel_settings():
 RECYCLE_HOURS = 4
 CONNECT_TIMEOUT = 5
 MAX_MESSAGE_LENGTH = 4000
-POST_INTERVAL_SECONDS = 600
-TARGET_CONFIGS = 8
-TARGET_PROXIES = 3
+TARGET_CONFIGS = 16
+TARGET_PROXIES = 6
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("zero-lost")
@@ -242,7 +241,7 @@ def parse_proxy_host_port(proxy_url):
 
 def tcp_check(host, port):
     if not isinstance(host, str) or not host or not port or not 1 <= port <= 65535 or "%" in host:
-        return False, 0, None
+        return False, 0
     try:
         addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         for family, kind, proto, _, endpoint in addresses:
@@ -256,39 +255,19 @@ def tcp_check(host, port):
                     conn.settimeout(CONNECT_TIMEOUT)
                     started = time.monotonic()
                     conn.connect(endpoint)
-                    return True, round((time.monotonic() - started) * 1000), str(address)
+                    return True, round((time.monotonic() - started) * 1000)
             except OSError:
                 continue
     except (OSError, ValueError, UnicodeError):
         pass
-    return False, 0, None
+    return False, 0
 
 def is_alive_and_ping(uri):
     host, port = parse_host_port(uri)
-    return tcp_check(host, port)
+    return (*tcp_check(host, port), host)
 
 def is_proxy_alive(proxy_url):
-    ok, ping_ms, _ = tcp_check(*parse_proxy_host_port(proxy_url))
-    return ok, ping_ms, proxy_url
-
-
-def country_flags(addresses):
-    if not addresses:
-        return {}
-    try:
-        response = requests.post("https://api.country.is/", json=sorted(addresses), timeout=4)
-        response.raise_for_status()
-        rows = response.json()
-    except (requests.RequestException, ValueError):
-        return {}
-    flags = {}
-    for row in rows if isinstance(rows, list) else []:
-        if not isinstance(row, dict):
-            continue
-        address, code = row.get("ip"), row.get("country")
-        if isinstance(address, str) and address in addresses and isinstance(code, str) and re.fullmatch(r"[A-Z]{2}", code) and code != "ZZ":
-            flags[address] = "".join(chr(0x1F1E6 + ord(letter) - ord("A")) for letter in code)
-    return flags
+    return (*tcp_check(*parse_proxy_host_port(proxy_url)), proxy_url)
 
 
 def rename_config_uri(uri, flag, channel_id):
@@ -316,12 +295,10 @@ def build_pack_post(valid_items, ch_info):
     body = ""
     used_keys = []
     
-    flags = country_flags({item[1] for item in valid_items})
-    for idx, (c_key, address, ping_ms, raw_uri) in enumerate(valid_items):
-        flag = flags.get(address)
-        renamed_uri = rename_config_uri(raw_uri, flag or "🌐", ch_id)
+    for idx, (c_key, flag, country, ping_ms, raw_uri) in enumerate(valid_items):
+        renamed_uri = rename_config_uri(raw_uri, flag, ch_id)
         num_emoji = NUM_EMOJIS[idx] if idx < len(NUM_EMOJIS) else f"{idx+1}."
-        block = f"{num_emoji} 🌐 {flag or 'کشور نامشخص'} | TCP: {ping_ms}ms\n"
+        block = f"{num_emoji} 🌐 {flag} ({country}) | TCP: {ping_ms}ms\n"
         block += f"<pre>{html.escape(renamed_uri)}</pre>\n\n"
         
         if len(header) + len(body) + len(block) + len(footer) <= MAX_MESSAGE_LENGTH:
@@ -363,7 +340,7 @@ def collect_github():
             if res: pool += res
     return list(dict.fromkeys(pool))
 
-def collect_valid_proxies(seen, now, max_needed=TARGET_PROXIES):
+def collect_valid_proxies(seen, now, max_needed=6):
     pool = []
     with ThreadPoolExecutor(max_workers=10) as ex:
         for res in ex.map(fetch_telegram_proxies, PROXY_TG_SOURCES):
@@ -400,79 +377,100 @@ def process_candidates(candidates, valid_items, max_needed):
             batch = candidates[i:i+30]
             results = list(ex.map(is_alive_and_ping, batch))
             
-            for cfg, (ok, ping_ms, address) in zip(batch, results):
+            for cfg, (ok, ping_ms, host) in zip(batch, results):
                 if ok:
                     c_key = config_key(cfg)
                     if c_key in seen_in_batch:
                         continue
-                    test_uri = rename_config_uri(cfg, "🌐", BRAND)
+                    country, flag = "اتصال TCP", "🌐"
+                    test_uri = rename_config_uri(cfg, flag, BRAND)
                     if len(test_uri) <= 700:
-                        valid_items.append((c_key, address, ping_ms, cfg))
+                        valid_items.append((c_key, flag, country, ping_ms, cfg))
                         seen_in_batch.add(c_key)
                     
                     if len(valid_items) >= max_needed: break
             if len(valid_items) >= max_needed: break
     return valid_items
 
-def prepare_post(seen, channel):
-    now = time.time()
-    valid_items = []
-
-    # --- مرحله اول: جستجوی کانفیگ در تلگرام ---
-    log.info("Collecting configs from Telegram...")
-    tg_cfgs = collect_telegram()
-    random.shuffle(tg_cfgs)
-    tg_candidates = [c for c in tg_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
-
-    valid_items = process_candidates(tg_candidates, valid_items, TARGET_CONFIGS)
-
-    # --- مرحله دوم: تکمیل ظرفیت کانفیگ از گیت‌هاب و لینک‌های ساب ---
-    if len(valid_items) < TARGET_CONFIGS:
-        needed = TARGET_CONFIGS - len(valid_items)
-        log.info(f"Need {needed} more configs. Fetching from GitHub...")
-        gh_cfgs = collect_github()
-        random.shuffle(gh_cfgs)
-        gh_candidates = [c for c in gh_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
-
-        valid_items = process_candidates(gh_candidates, valid_items, TARGET_CONFIGS)
-    post_text, used_keys = build_pack_post(valid_items, channel)
-    if not used_keys:
-        return None
-    proxies = collect_valid_proxies(seen, now, TARGET_PROXIES)
-    return post_text, build_keyboard(proxies, channel["url"]), [*used_keys, *(url for url, _ in proxies)]
-
-
-def run_publisher(bot, channel):
-    next_slot = time.monotonic()
-    while True:
-        try:
-            seen = load_seen()
-            last_sent = max(seen.values(), default=0)
-            remaining = min(POST_INTERVAL_SECONDS, max(0, last_sent + POST_INTERVAL_SECONDS - time.time()))
-            next_slot = max(next_slot, time.monotonic() + remaining)
-            post = prepare_post(seen, channel)
-            time.sleep(max(0, next_slot - time.monotonic()))
-            if post:
-                text, keyboard, keys = post
-                bot.send_message(channel["id"], text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=keyboard)
-                sent_at = time.time()
-                seen.update(dict.fromkeys(keys, sent_at))
-                save_seen(seen)
-                log.info("Sent one post to %s", channel["id"])
-            else:
-                log.info("No eligible configs; skipping this slot")
-        except Exception as error:
-            log.error("Round failed (%s)", type(error).__name__)
-            time.sleep(max(0, next_slot - time.monotonic()))
-        next_slot = time.monotonic() + POST_INTERVAL_SECONDS
-
-
 if __name__ == "__main__":
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN before starting Zero Lost.")
     bot = telebot.TeleBot(token, threaded=False)
-    channel = channel_settings()
+    CHANNELS = [channel_settings()]
     DATA_DIR.mkdir(mode=0o700, exist_ok=True)
     log.info("Zero Lost started")
-    run_publisher(bot, channel)
+    while True:
+        try:
+            seen = load_seen()
+            now = time.time()
+            valid_items = []
+            
+            # --- مرحله اول: جستجوی کانفیگ در تلگرام ---
+            log.info("Collecting configs from Telegram...")
+            tg_cfgs = collect_telegram()
+            random.shuffle(tg_cfgs)
+            tg_candidates = [c for c in tg_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
+            
+            valid_items = process_candidates(tg_candidates, valid_items, TARGET_CONFIGS)
+            
+            # --- مرحله دوم: تکمیل ظرفیت کانفیگ از گیت‌هاب و لینک‌های ساب ---
+            if len(valid_items) < TARGET_CONFIGS:
+                needed = TARGET_CONFIGS - len(valid_items)
+                log.info(f"Need {needed} more configs. Fetching from GitHub...")
+                gh_cfgs = collect_github()
+                random.shuffle(gh_cfgs)
+                gh_candidates = [c for c in gh_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
+                
+                valid_items = process_candidates(gh_candidates, valid_items, TARGET_CONFIGS)
+
+            # --- مرحله سوم: جمع‌آوری و تست پروکسی‌های تلگرام ---
+            log.info("Collecting MTProto proxies...")
+            valid_proxies = collect_valid_proxies(seen, now, TARGET_PROXIES)
+
+            # --- ساخت و ارسال ۲ پست (با فاصله ۵ تا ۱۰ ثانیه) ---
+            if valid_items:
+                packs = [
+                    (valid_items[:8], valid_proxies[:3]),
+                    (valid_items[8:16], valid_proxies[3:6])
+                ]
+                
+                for ch in CHANNELS:
+                    sent_count = 0
+                    for p_idx, (pack_cfgs, pack_proxies) in enumerate(packs):
+                        if not pack_cfgs:
+                            continue
+                        if p_idx > 0 and sent_count > 0:
+                            gap = random.uniform(5, 10)
+                            log.info(f"Waiting {gap:.1f}s before sending 2nd post to {ch['id']}...")
+                            time.sleep(gap)
+                            
+                        post_text, used_keys = build_pack_post(pack_cfgs, ch)
+                        if post_text and used_keys:
+                            try:
+                                keyboard = build_keyboard(pack_proxies, ch["url"])
+                                bot.send_message(
+                                    ch["id"], 
+                                    post_text, 
+                                    parse_mode="HTML", 
+                                    disable_web_page_preview=True,
+                                    reply_markup=keyboard
+                                )
+                                sent_count += 1
+                                for key in [*used_keys, *(url for url, _ in pack_proxies)]:
+                                    seen[key] = time.time()
+                                log.info(f"Sent post #{p_idx+1} to {ch['id']} ({len(used_keys)} configs, {len(pack_proxies)} proxies)")
+                            except Exception as e:
+                                log.error("Telegram send failed (%s)", type(e).__name__)
+                            else:
+                                save_seen(seen)
+                    time.sleep(2)
+                
+
+
+            log.info("Waiting 10 minutes...")
+            time.sleep(600) 
+            
+        except Exception as e:
+            log.error("Round failed (%s)", type(e).__name__)
+            time.sleep(60)
