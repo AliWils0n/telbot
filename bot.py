@@ -3,6 +3,8 @@ import re, time, json, base64, socket, logging, random, os, urllib.parse, html
 from concurrent.futures import ThreadPoolExecutor
 import ipaddress
 from pathlib import Path
+from threading import Thread
+from panel import Store, attach, channel_id, schedule_loop, template
 import requests, telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -11,26 +13,18 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("STATE_DIRECTORY") or BASE_DIR / "data")
 SEEN_FILE = DATA_DIR / "seen.json"
 
-def channel_settings():
+def initial_target():
     target = os.environ.get("ZERO_LOST_CHANNEL_ID", "@ZiroLost").strip()
-    url = "https://t.me/ZiroLost"
     if re.fullmatch(r"-100[0-9]+", target):
         target = int(target)
     elif not re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}", target):
         raise SystemExit("Set ZERO_LOST_CHANNEL_ID to your channel @username or numeric -100... ID.")
-    footer = (
-        "زمان درج‌شده فقط زمان اتصال TCP از سرور ربات است؛ کارکرد سرویس تضمین نیست.\n\n"
-        f'<a href="{url}">📢 کانال اصلی زیرولاست</a>\n'
-        '<a href="https://t.me/ZiroLost_Vip">🔔 اطلاع‌رسانی VIP</a>\n'
-        '<a href="https://t.me/zerolostbot">🤖 ربات زیرولاست</a>'
-    )
-    return {"id": target, "url": url, "header": f"🚀 <b>{BRAND}</b> | کانفیگ و پروکسی\n\n", "footer": footer}
+    return target
 
 
 RECYCLE_HOURS = 4
 CONNECT_TIMEOUT = 5
 MAX_MESSAGE_LENGTH = 4000
-POST_INTERVAL_SECONDS = 600
 TARGET_CONFIGS = 8
 TARGET_PROXIES = 3
 
@@ -349,10 +343,10 @@ def build_keyboard(proxies_list, channel_url):
     return markup if p_buttons else None
 
 
-def collect_telegram():
+def collect_telegram(sources):
     pool = []
     with ThreadPoolExecutor(max_workers=10) as ex:
-        for res in ex.map(fetch_telegram, TG_SOURCES):
+        for res in ex.map(fetch_telegram, sources):
             if res: pool += res
     return list(dict.fromkeys(pool))
 
@@ -414,13 +408,13 @@ def process_candidates(candidates, valid_items, max_needed):
             if len(valid_items) >= max_needed: break
     return valid_items
 
-def prepare_post(seen, channel):
+def prepare_post(seen, sources):
     now = time.time()
     valid_items = []
 
     # --- مرحله اول: جستجوی کانفیگ در تلگرام ---
     log.info("Collecting configs from Telegram...")
-    tg_cfgs = collect_telegram()
+    tg_cfgs = collect_telegram(sources)
     random.shuffle(tg_cfgs)
     tg_candidates = [c for c in tg_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
 
@@ -435,36 +429,45 @@ def prepare_post(seen, channel):
         gh_candidates = [c for c in gh_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
 
         valid_items = process_candidates(gh_candidates, valid_items, TARGET_CONFIGS)
-    post_text, used_keys = build_pack_post(valid_items, channel)
-    if not used_keys:
+    if not valid_items:
         return None
     proxies = collect_valid_proxies(seen, now, TARGET_PROXIES)
-    return post_text, build_keyboard(proxies, channel["url"]), [*used_keys, *(url for url, _ in proxies)]
+    return valid_items, proxies
 
 
-def run_publisher(bot, channel):
-    next_slot = time.monotonic()
+def run_publisher(bot, store):
+    last_round = max(load_seen().values(), default=0)
     while True:
         try:
             seen = load_seen()
-            last_sent = max(seen.values(), default=0)
-            remaining = min(POST_INTERVAL_SECONDS, max(0, last_sent + POST_INTERVAL_SECONDS - time.time()))
-            next_slot = max(next_slot, time.monotonic() + remaining)
-            post = prepare_post(seen, channel)
-            time.sleep(max(0, next_slot - time.monotonic()))
+            post = prepare_post(seen, store.snapshot()["sources"])
+            while True:
+                settings = store.snapshot()
+                remaining = last_round + settings["minutes"] * 60 - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(5, remaining))
             if post:
-                text, keyboard, keys = post
-                bot.send_message(channel["id"], text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=keyboard)
-                sent_at = time.time()
-                seen.update(dict.fromkeys(keys, sent_at))
-                save_seen(seen)
-                log.info("Sent one post to %s", channel["id"])
+                items, proxies = post
+                channel = template(settings["fields"])
+                text, keys = build_pack_post(items, channel)
+                if text:
+                    keyboard = build_keyboard(proxies, channel["url"])
+                    for target in settings["targets"]:
+                        try:
+                            bot.send_message(channel_id(target), text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=keyboard)
+                        except Exception as error:
+                            log.error("Send to %s failed (%s)", target, type(error).__name__)
+                            continue
+                        seen.update(dict.fromkeys([*keys, *(url for url, _ in proxies)], time.time()))
+                        save_seen(seen)
+                        log.info("Sent one post to %s", target)
             else:
                 log.info("No eligible configs; skipping this slot")
         except Exception as error:
             log.error("Round failed (%s)", type(error).__name__)
-            time.sleep(max(0, next_slot - time.monotonic()))
-        next_slot = time.monotonic() + POST_INTERVAL_SECONDS
+            time.sleep(15)
+        last_round = time.time()
 
 
 if __name__ == "__main__":
@@ -472,7 +475,11 @@ if __name__ == "__main__":
     if not token:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN before starting Zero Lost.")
     bot = telebot.TeleBot(token, threaded=False)
-    channel = channel_settings()
     DATA_DIR.mkdir(mode=0o700, exist_ok=True)
     log.info("Zero Lost started")
-    run_publisher(bot, channel)
+    store = Store(DATA_DIR / "panel.json", initial_target(), TG_SOURCES)
+    control = telebot.TeleBot(os.environ.get("ZERO_LOST_PANEL_TOKEN") or token, threaded=False)
+    attach(control, store)
+    Thread(target=control.infinity_polling, kwargs={"skip_pending": True, "allowed_updates": ["message"]}, daemon=True).start()
+    Thread(target=schedule_loop, args=(store, bot, control), daemon=True).start()
+    run_publisher(bot, store)
