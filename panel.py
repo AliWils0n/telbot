@@ -92,16 +92,18 @@ def tick(store, publisher, control):
             continue
         try:
             target = channel_id(job["target"])
-            photo = job.get("photo")
-            if not photo:
+            attachment = job.get("photo") or job.get("image_document")
+            if not attachment:
                 publisher.send_message(target, job["body"], disable_web_page_preview=True)
-            elif control.token == publisher.token:
-                publisher.send_photo(target, photo, caption=job["body"] or None)
             else:
-                remote = control.get_file(photo)
-                with io.BytesIO(control.download_file(remote.file_path)) as upload:
-                    upload.name = "photo.jpg"
-                    publisher.send_photo(target, upload, caption=job["body"] or None)
+                send = publisher.send_document if job.get("image_document") else publisher.send_photo
+                if control.token == publisher.token:
+                    send(target, attachment, caption=job["body"] or None)
+                else:
+                    remote = control.get_file(attachment)
+                    with io.BytesIO(control.download_file(remote.file_path)) as upload:
+                        upload.name = job.get("image_name", "photo.jpg")
+                        send(target, upload, caption=job["body"] or None)
         except Exception as error:
             log.warning("Scheduled post %s failed (%s)", key, type(error).__name__)
             def failed(data):
@@ -155,7 +157,8 @@ def attach(control, store):
     def handle(message):
         text = (message.text or "").strip()
         step = state.get("step")
-        if message.content_type == "photo" and step != "body":
+        image_message = message.content_type in ("photo", "document")
+        if image_message and step != "body":
             return control.send_message(OWNER, "عکس را بعد از انتخاب «پیام جدید» و کانال مقصد بفرست.")
         data = store.snapshot()
         if text in (HOME, "/panel", "/start", "/cancel"):
@@ -179,7 +182,7 @@ def attach(control, store):
                 for key, job in jobs.items():
                     status = {"ready": "فعال", "sending": "ارسال نامشخص", "failed": "ناموفق"}[job["status"]]
                     repeat = "روزانه" if job["clock"] else "یک‌بار"
-                    label = "📷 " if job.get("photo") else ""
+                    label = "📎 " if job.get("image_document") else "📷 " if job.get("photo") else ""
                     lines.append(f"#{key} · {job['target']} · {repeat} · {display_time(job['due'])} · {status}\n{label}{job['body'][:32]}")
                 return prompt("delete_job", "\n".join(lines) + "\nبرای حذف، شمارهٔ برنامه را انتخاب کن.", list(jobs))
             return menu()
@@ -238,17 +241,25 @@ def attach(control, store):
             state["target"] = text
             return prompt("body", "متن یا یک عکس بفرست. اگر کپشن می‌خواهی، موقع ارسال عکس زیرش بنویس.")
         if step == "body":
-            if message.content_type == "photo":
-                if message.media_group_id:
+            if image_message:
+                if getattr(message, "media_group_id", None):
                     raise ValueError("فقط یک عکس بفرست، نه آلبوم.")
                 text = message.caption or ""
                 if len(text) > 1024:
                     raise ValueError("کپشن طولانی است؛ عکس را با کپشن کوتاه‌تر بفرست.")
-                state["photo"] = max(message.photo, key=lambda size: size.width * size.height).file_id
+                if message.content_type == "document":
+                    document = message.document
+                    names = {"image/jpeg": "image.jpg", "image/png": "image.png"}
+                    mime = getattr(document, "mime_type", None)
+                    if mime not in names or not 0 < (getattr(document, "file_size", 0) or 0) <= 10 * 1024 * 1024:
+                        raise ValueError("فایل باید عکس JPG یا PNG تا ۱۰ مگابایت باشد؛ یا عکس را با گزینهٔ Photo بفرست.")
+                    state.update(image_document=document.file_id, image_name=names[mime])
+                else:
+                    state["photo"] = max(message.photo, key=lambda size: size.width * size.height).file_id
             elif not text or len(text.encode("utf-16-le")) // 2 > 4000:
                 raise ValueError("متن باید بین ۱ تا ۴۰۰۰ کاراکتر باشد.")
             state["body"] = text
-            return prompt("mode", "چه زمانی فرستاده شود؟", [NOW, LATER, DAILY])
+            return prompt("mode", ("عکس دریافت شد. " if image_message else "") + "چه زمانی فرستاده شود؟", [NOW, LATER, DAILY])
         if step == "mode":
             if text not in (NOW, LATER, DAILY):
                 raise ValueError("یکی از سه حالت را انتخاب کن.")
@@ -280,6 +291,8 @@ def attach(control, store):
                 settings["jobs"][key] = dict(target=state["target"], body=state["body"], due=due, clock=state["clock"], status="ready")
                 if "photo" in state:
                     settings["jobs"][key]["photo"] = state["photo"]
+                if "image_document" in state:
+                    settings["jobs"][key].update(image_document=state["image_document"], image_name=state["image_name"])
                 return key
             return menu("برنامه ثبت شد: #" + store.change(add))
         elif step == "delete_job":
@@ -293,10 +306,10 @@ def attach(control, store):
             store.change(lambda settings: settings["jobs"].pop(state["key"], None))
             return menu("برنامه لغو شد.")
         when = state["clock"] or (f"{state['delay']//60} دقیقه بعد از تأیید" if state["delay"] else "بعد از تأیید")
-        label = "📷 عکس\n" if "photo" in state else ""
+        label = "📎 فایل تصویر\n" if "image_document" in state else "📷 عکس\n" if "photo" in state else ""
         return prompt("confirm", f"مقصد: {state['target']}\n{state['mode']} · {when} (تهران)\n\n{label}{state['body'][:500]}\n\nثبت شود؟", [CONFIRM])
 
-    @control.message_handler(func=lambda message: message.chat.type == "private" and message.from_user is not None and message.from_user.id == OWNER and message.chat.id == OWNER, content_types=["text", "photo"])
+    @control.message_handler(func=lambda message: message.chat.type == "private" and message.from_user is not None and message.from_user.id == OWNER and message.chat.id == OWNER, content_types=["text", "photo", "document"])
     def owner_message(message):
         try:
             handle(message)
