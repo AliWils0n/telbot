@@ -242,7 +242,7 @@ def parse_proxy_host_port(proxy_url):
 
 def tcp_check(host, port):
     if not isinstance(host, str) or not host or not port or not 1 <= port <= 65535 or "%" in host:
-        return False, 0
+        return False, 0, None
     try:
         addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
         for family, kind, proto, _, endpoint in addresses:
@@ -256,19 +256,39 @@ def tcp_check(host, port):
                     conn.settimeout(CONNECT_TIMEOUT)
                     started = time.monotonic()
                     conn.connect(endpoint)
-                    return True, round((time.monotonic() - started) * 1000)
+                    return True, round((time.monotonic() - started) * 1000), str(address)
             except OSError:
                 continue
     except (OSError, ValueError, UnicodeError):
         pass
-    return False, 0
+    return False, 0, None
 
 def is_alive_and_ping(uri):
     host, port = parse_host_port(uri)
-    return (*tcp_check(host, port), host)
+    return tcp_check(host, port)
 
 def is_proxy_alive(proxy_url):
-    return (*tcp_check(*parse_proxy_host_port(proxy_url)), proxy_url)
+    ok, ping_ms, _ = tcp_check(*parse_proxy_host_port(proxy_url))
+    return ok, ping_ms, proxy_url
+
+
+def country_flags(addresses):
+    if not addresses:
+        return {}
+    try:
+        response = requests.post("https://api.country.is/", json=sorted(addresses), timeout=4)
+        response.raise_for_status()
+        rows = response.json()
+    except (requests.RequestException, ValueError):
+        return {}
+    flags = {}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        address, code = row.get("ip"), row.get("country")
+        if isinstance(address, str) and address in addresses and isinstance(code, str) and re.fullmatch(r"[A-Z]{2}", code) and code != "ZZ":
+            flags[address] = "".join(chr(0x1F1E6 + ord(letter) - ord("A")) for letter in code)
+    return flags
 
 
 def rename_config_uri(uri, flag, channel_id):
@@ -296,10 +316,12 @@ def build_pack_post(valid_items, ch_info):
     body = ""
     used_keys = []
     
-    for idx, (c_key, flag, country, ping_ms, raw_uri) in enumerate(valid_items):
-        renamed_uri = rename_config_uri(raw_uri, flag, ch_id)
+    flags = country_flags({item[1] for item in valid_items})
+    for idx, (c_key, address, ping_ms, raw_uri) in enumerate(valid_items):
+        flag = flags.get(address)
+        renamed_uri = rename_config_uri(raw_uri, flag or "🌐", ch_id)
         num_emoji = NUM_EMOJIS[idx] if idx < len(NUM_EMOJIS) else f"{idx+1}."
-        block = f"{num_emoji} 🌐 {flag} ({country}) | TCP: {ping_ms}ms\n"
+        block = f"{num_emoji} 🌐 {flag or 'کشور نامشخص'} | TCP: {ping_ms}ms\n"
         block += f"<pre>{html.escape(renamed_uri)}</pre>\n\n"
         
         if len(header) + len(body) + len(block) + len(footer) <= MAX_MESSAGE_LENGTH:
@@ -378,15 +400,14 @@ def process_candidates(candidates, valid_items, max_needed):
             batch = candidates[i:i+30]
             results = list(ex.map(is_alive_and_ping, batch))
             
-            for cfg, (ok, ping_ms, host) in zip(batch, results):
+            for cfg, (ok, ping_ms, address) in zip(batch, results):
                 if ok:
                     c_key = config_key(cfg)
                     if c_key in seen_in_batch:
                         continue
-                    country, flag = "اتصال TCP", "🌐"
-                    test_uri = rename_config_uri(cfg, flag, BRAND)
+                    test_uri = rename_config_uri(cfg, "🌐", BRAND)
                     if len(test_uri) <= 700:
-                        valid_items.append((c_key, flag, country, ping_ms, cfg))
+                        valid_items.append((c_key, address, ping_ms, cfg))
                         seen_in_batch.add(c_key)
                     
                     if len(valid_items) >= max_needed: break
