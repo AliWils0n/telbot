@@ -1,304 +1,476 @@
-import copy
-import html
-import io
-import json
-import logging
-import os
-import re
-import threading
-import time
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+# -*- coding: utf-8 -*-
+import re, time, json, base64, socket, logging, random, os, urllib.parse, html
+from concurrent.futures import ThreadPoolExecutor
+import ipaddress
+from pathlib import Path
+import requests, telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from telebot.types import ReplyKeyboardMarkup
+BRAND = "Zero Lost | زیرولاست"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("STATE_DIRECTORY") or BASE_DIR / "data")
+SEEN_FILE = DATA_DIR / "seen.json"
 
-OWNER = 1358769287
-TEHRAN = ZoneInfo("Asia/Tehran")
-HOME = "🏠 منوی اصلی"
-INTERVAL = "⏱ فاصله انتشار"
-TARGETS = "📣 کانال‌های مقصد"
-SOURCES = "📥 منابع کانفیگ"
-TEMPLATE = "✏️ متن و لینک‌ها"
-SCHEDULE = "🗓 پیام جدید"
-JOBS = "📋 برنامه‌ها"
-ADD, REMOVE = "➕ افزودن", "➖ حذف"
-NOW, LATER, DAILY = "یک بار، همین حالا", "یک بار، با تأخیر", "هر روز"
-CONFIRM = "✅ ثبت برنامه"
-CLEAR = "🗑 پاک کردن این بخش"
-FIELDS = {"تیتر": "title", "توضیح زیر پست": "note", "لینک کانال اصلی": "main", "لینک اطلاع‌رسانی": "vip", "لینک ربات": "bot"}
-DEFAULTS = {"title": "Zero Lost | زیرولاست | کانفیگ و پروکسی", "note": "زمان درج‌شده فقط زمان اتصال TCP از سرور ربات است؛ کارکرد سرویس تضمین نیست.", "main": "https://t.me/ZiroLost", "vip": "https://t.me/ZiroLost_Vip", "bot": "https://t.me/zerolostbot"}
+def channel_settings():
+    target = os.environ.get("ZERO_LOST_CHANNEL_ID", "@ZiroLost").strip()
+    url = "https://t.me/ZiroLost"
+    if re.fullmatch(r"-100[0-9]+", target):
+        target = int(target)
+    elif not re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}", target):
+        raise SystemExit("Set ZERO_LOST_CHANNEL_ID to your channel @username or numeric -100... ID.")
+    footer = (
+        "زمان درج‌شده فقط زمان اتصال TCP از سرور ربات است؛ کارکرد سرویس تضمین نیست.\n\n"
+        f'<a href="{url}">📢 کانال اصلی زیرولاست</a>\n'
+        '<a href="https://t.me/ZiroLost_Vip">🔔 اطلاع‌رسانی VIP</a>\n'
+        '<a href="https://t.me/zerolostbot">🤖 ربات زیرولاست</a>'
+    )
+    return {"id": target, "url": url, "header": f"🚀 <b>{BRAND}</b> | کانفیگ و پروکسی\n\n", "footer": footer}
+
+
+RECYCLE_HOURS = 4
+CONNECT_TIMEOUT = 5
+MAX_MESSAGE_LENGTH = 4000
+TARGET_CONFIGS = 16
+TARGET_PROXIES = 6
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("zero-lost")
 
+# ------------------- 2. منابع تلگرام (کانفیگ) -------------------
+TG_SOURCES = [
+    "SOSkeyNET", "ConfigsHUB", "FarahVPN", "Farah_VPN", "ConfigsHUB2",
+    "ConfigX2ray", "v2ray1_ng", "AarazV2ray", "V2rayBaaz", "V2rayEnglish",
+    "prrofile_purple", "SimChin_ir", "IRAN_V2RAY1", "Leviko_V2ray",
+    "Outline_Vpn", "v2nodes", "SPARTAN_YT", "BigSmoke_Config", "FarazV2ray",
+    "v2ray_outlineir", "PrivateVPNs", "V2rayNG_Fast", "FreeV2rays", "DailyV2RY"
+]
 
-class Store:
-    def __init__(self, path, target, sources):
-        self.path = path
-        self.lock = threading.RLock()
-        self.data = {"minutes": 10, "targets": [str(target)], "sources": list(sources), "fields": dict(DEFAULTS), "jobs": {}, "next_id": 1}
-        if path.exists():
-            self.data.update(json.loads(path.read_text(encoding="utf-8")))
+# ------------------- 3. منابع تلگرام (پروکسی) -------------------
+PROXY_TG_SOURCES = [
+    "Farah_Proxy", "FarahProxy", "ProxyMTProto", "Proxy_Qavi",
+    "iMTProxy_ir", "ShahinProxi", "iMTProto", "ProxyMTProto_tel",
+    "i8proxy", "TelMTProto", "darkproxy", "iRoProxy",
+    "MTProxyStar", "letsproxys1", "ProxGp", "Myporoxy", "ProxyDaemi"
+]
 
-    def snapshot(self):
-        with self.lock:
-            return copy.deepcopy(self.data)
+# ------------------- 4. منابع گیت‌هاب و وب (پروکسی) -------------------
+PROXY_GH_SOURCES = [
+    "https://raw.githubusercontent.com/0xRadikal/Free-Telegram-Proxy/main/top100.txt",
+    "https://raw.githubusercontent.com/0xRadikal/Free-Telegram-Proxy/main/faketls/all.txt",
+    "https://raw.githubusercontent.com/0xRadikal/Free-Telegram-Proxy/main/resilient/all.txt",
+    "https://raw.githubusercontent.com/zakky8/mtproto-proxy-pro/main/censorship_resistant.txt",
+    "https://raw.githubusercontent.com/zakky8/mtproto-proxy-pro/main/all_proxies.txt",
+    "https://tgmtproxy.github.io/mtproxy/proxies.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/mtproto/master/all_proxies.txt",
+    "https://raw.githubusercontent.com/Grim1313/mtproto-for-telegram/master/all_proxies.txt",
+    "https://raw.githubusercontent.com/dubblebyte/free-mtproto-proxies/main/all_proxies.txt",
+    "https://raw.githubusercontent.com/ALIILAPRO/MTProtoProxy/main/mtproto.txt",
+    "https://raw.githubusercontent.com/soroushmirzaei/telegram-proxies-collector/main/proxies.txt",
+    "https://raw.githubusercontent.com/MuLTi-Co/MTProto-Proxy/main/proxies.txt",
+    "https://raw.githubusercontent.com/B3H1Z/MTProto-Proxy/main/proxies.txt",
+    "https://raw.githubusercontent.com/yebekhe/MTProtoCollector/main/proxy/mtproto.txt"
+]
 
-    def change(self, action):
-        with self.lock:
-            new = copy.deepcopy(self.data)
-            result = action(new)
-            temp = self.path.with_suffix(".tmp")
-            temp.write_text(json.dumps(new, ensure_ascii=False), encoding="utf-8")
-            os.replace(temp, self.path)
-            self.data = new
-            return result
+# ------------------- 5. منابع گیت‌هاب و ساب (کانفیگ) -------------------
+GITHUB_SOURCES = [
+    "https://raw.githubusercontent.com/noahclanman/free-xray-gcp/main/output/top100.txt",
+    "https://raw.githubusercontent.com/noahclanman/free-xray-gcp/main/output/fast/configs.txt",
+    "https://raw.githubusercontent.com/noahclanman/free-xray-gcp/main/output/transports/ws_tls.txt",
+    "https://raw.githubusercontent.com/mohammadaz2/v2rayConfigsForYou/main/configs.txt",
+    "https://raw.githubusercontent.com/mohammadaz2/v2rayConfigsForYou/main/sub/vless.txt",
+    "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/all_servers.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub1.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub2.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-config/main/Splitted-By-Protocol/vless.txt",
+    "https://matinghanbari.github.io/v2ray-configs/index.html",
+    "https://v2freehub-sub.v2freehub.workers.dev/",
+    "https://sub.vlessfo.ru/vlessforu/working_configs.txt",
+    "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs_base64.txt",
+    "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/all/configs.txt",
+    "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/all_configs.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/v2ray-configs/main/all_configs.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Subscribes/sub1.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Subscribes/sub2.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Subscribes/sub3.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Subscribes/sub4.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Subscribes/sub5.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Protocols/vless.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Protocols/vmess.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Protocols/shadowsocks.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/Protocols/trojan.txt",
+    "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/super-sub.txt",
+    "https://raw.githubusercontent.com/coldwater-10/V2ray-Config-Lite/main/Sub1.txt",
+    "https://raw.githubusercontent.com/coldwater-10/V2ray-Config-Lite/main/Sub2.txt",
+    "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/main/configs/ir/all.txt",
+    "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/main/configs/ir/light.txt",
+    "https://raw.githubusercontent.com/FNET00bot/FNET00/Config/Main",
+    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha.txt",
+    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/all_extracted_configs.txt",
+    "https://raw.githubusercontent.com/expressalaki/ExpressVPN/refs/heads/main/configs2.txt",
+    "https://raw.githubusercontent.com/expressalaki/ExpressVPN/refs/heads/main/configs.txt",
+    "https://raw.githubusercontent.com/v2FreeHub/v2hub-configs/refs/heads/main/Sub-AutoUpdate",
+    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/All_Configs_Sub.txt",
+    "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
+    "https://raw.githubusercontent.com/V2RAYCONFIGSPOOL/V2RAY_SUB/main/all_configs.txt",
+    "https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/mix_sub.txt",
+    "https://raw.githubusercontent.com/youfoundamin/V2rayCollector/main/vless_iran.txt",
+    "https://raw.githubusercontent.com/youfoundamin/V2rayCollector/main/mixed_iran.txt",
+    "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/normal/vless",
+    "https://raw.githubusercontent.com/yebekhe/TVC/main/subscriptions/xray/normal/reality",
+    "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
+    "https://raw.githubusercontent.com/soroushmirzaei/telegram-configs-collector/main/protocols/vless",
+    "https://raw.githubusercontent.com/soroushmirzaei/telegram-configs-collector/main/protocols/reality",
+    "https://raw.githubusercontent.com/soroushmirzaei/telegram-configs-collector/main/protocols/trojan",
+    "https://raw.githubusercontent.com/Kwinwoo/config-v2ray/main/vless.txt",
+    "https://raw.githubusercontent.com/Kwinwoo/config-v2ray/main/reality.txt",
+    "https://raw.githubusercontent.com/amirhosein-v2ray/Free-V2ray-Config/main/All_Configs_Sub.txt",
+    "https://raw.githubusercontent.com/Firmfox/proxify/main/v2ray_configs/subscriptions/subscription-1.txt",
+    "https://raw.githubusercontent.com/Firmfox/proxify/main/v2ray_configs/subscriptions/subscription-2.txt",
+    "https://raw.githubusercontent.com/Firmfox/proxify/main/v2ray_configs/subscriptions/subscription-3.txt",
+    "https://raw.githubusercontent.com/Firmfox/proxify/main/v2ray_configs/subscriptions/subscription-4.txt",
+    "https://raw.githubusercontent.com/Firmfox/proxify/main/v2ray_configs/subscriptions/subscription-5.txt",
+    "https://raw.githubusercontent.com/pog7x/vpn-configs/refs/heads/master/githubmirror/3.txt",
+    "https://raw.githubusercontent.com/pog7x/vpn-configs/refs/heads/master/githubmirror/4.txt",
+    "https://raw.githubusercontent.com/pog7x/vpn-configs/refs/heads/master/githubmirror/5.txt",
+    "https://raw.githubusercontent.com/pog7x/vpn-configs/refs/heads/master/githubmirror/7.txt",
+    "https://raw.githubusercontent.com/pog7x/vpn-configs/refs/heads/master/githubmirror/8.txt",
+    "https://raw.githubusercontent.com/pog7x/vpn-configs/refs/heads/master/githubmirror/9.txt",
+    "https://raw.githubusercontent.com/pog7x/vpn-configs/refs/heads/master/githubmirror/10.txt"
+]
+
+URI_RE = re.compile(r"(?:vless|vmess|ss|trojan|socks5|socks)://[^\s<>\"']+")
+PROXY_RE = re.compile(r"(?:https?://t\.me/proxy\?|tg://proxy\?)[^\s<>\"']+")
+NUM_EMOJIS = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣"]
+PERSIAN_NUMS = ["۱", "۲", "۳"]
+
+def load_seen():
+    try:
+        with SEEN_FILE.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    cutoff = time.time() - RECYCLE_HOURS * 3600
+    return {key: stamp for key, stamp in data.items() if isinstance(stamp, (float, int)) and stamp > cutoff}
+
+def save_seen(seen):
+    temp_file = SEEN_FILE.with_suffix(".tmp")
+    with temp_file.open("w", encoding="utf-8") as handle:
+        json.dump(seen, handle)
+    temp_file.replace(SEEN_FILE)
 
 
-def template(fields):
-    footer = [html.escape(fields["note"])] if fields["note"] else []
-    for key, label in [("main", "📢 کانال اصلی زیرولاست"), ("vip", "🔔 اطلاع‌رسانی VIP"), ("bot", "🤖 ربات زیرولاست")]:
-        if fields[key]:
-            footer.append(f'<a href="{html.escape(fields[key], quote=True)}">{label}</a>')
-    title = html.escape(fields["title"])
-    return {"url": fields["main"], "header": f"<b>{title}</b>\n\n" if title else "", "footer": "\n".join(footer)}
+def config_key(uri):
+    core = uri.split("#", 1)[0]
+    return core.strip().rstrip("/")
 
-
-def next_daily(clock, now):
-    local = datetime.fromtimestamp(now, TEHRAN)
-    hour, minute = map(int, clock.split(":"))
-    due = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    return (due if due > local else due + timedelta(days=1)).timestamp()
-
-
-def display_time(stamp):
-    return datetime.fromtimestamp(stamp, TEHRAN).strftime("%Y-%m-%d %H:%M")
-
-
-def channel_id(target):
-    return int(target) if target.startswith("-") else target
-
-
-def tick(store, publisher, control):
-    for key, job in store.snapshot()["jobs"].items():
-        now = time.time()
-        if job["due"] > now or job.get("status", "ready") != "ready":
-            continue
-        def claim(data):
-            current = data["jobs"].get(key)
-            if current != job or job["target"] not in data["targets"]:
-                return False
-            current["status"] = "sending"
-            return True
-        if not store.change(claim):
-            continue
+def extract(text):
+    if not text: return []
+    text = html.unescape(text)
+    res = URI_RE.findall(text)
+    if not res:
         try:
-            target = channel_id(job["target"])
-            photo = job.get("photo")
-            if not photo:
-                publisher.send_message(target, job["body"], disable_web_page_preview=True)
-            elif control.token == publisher.token:
-                publisher.send_photo(target, photo, caption=job["body"] or None)
-            else:
-                remote = control.get_file(photo)
-                with io.BytesIO(control.download_file(remote.file_path)) as upload:
-                    upload.name = "photo.jpg"
-                    publisher.send_photo(target, upload, caption=job["body"] or None)
-        except Exception as error:
-            log.warning("Scheduled post %s failed (%s)", key, type(error).__name__)
-            def failed(data):
-                if key in data["jobs"]:
-                    data["jobs"][key]["status"] = "failed"
-            store.change(failed)
+            pad = text.strip() + "=" * (-len(text.strip()) % 4)
+            decoded = base64.b64decode(pad.encode()).decode("utf-8", errors="ignore")
+            decoded = html.unescape(decoded)
+            res = URI_RE.findall(decoded)
+        except Exception: pass
+    return res
+
+def extract_proxies(text):
+    if not text: return []
+    text = html.unescape(text)
+    raw_proxies = PROXY_RE.findall(text)
+    clean_proxies = []
+    for p in raw_proxies:
+        p = p.replace("tg://proxy?", "https://t.me/proxy?")
+        if "server=" in p and "port=" in p and "secret=" in p:
+            clean_proxies.append(p)
+    return clean_proxies
+
+def fetch_github(url):
+    try:
+        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200: return extract(r.text)
+    except: pass
+    return []
+
+def fetch_github_proxies(url):
+    try:
+        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200: return extract_proxies(r.text)
+    except: pass
+    return []
+
+def fetch_telegram(ch):
+    try:
+        r = requests.get(f"https://t.me/s/{ch}", timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        return extract(r.text)
+    except: return []
+
+def fetch_telegram_proxies(ch):
+    try:
+        r = requests.get(f"https://t.me/s/{ch}", timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        return extract_proxies(r.text)
+    except: return []
+
+def parse_host_port(uri):
+    try:
+        scheme, rest = uri.split("://", 1)
+        if scheme == "vmess":
+            pad = rest.split("#", 1)[0]
+            pad += "=" * (-len(pad) % 4)
+            j = json.loads(base64.urlsafe_b64decode(pad.encode()).decode("utf-8", errors="ignore"))
+            return j.get("add"), int(j.get("port", 0))
+        parsed = urllib.parse.urlsplit(uri.split("#", 1)[0])
+        if scheme == "ss" and not parsed.port and "@" not in parsed.netloc:
+            value = parsed.netloc
+            decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
+            parsed = urllib.parse.urlsplit("ss://" + decoded)
+        return parsed.hostname, parsed.port or 443
+
+    except: return None, None
+
+def parse_proxy_host_port(proxy_url):
+    try:
+        parsed = urllib.parse.urlparse(proxy_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        server = qs.get("server", [None])[0]
+        port = int(qs.get("port", [0])[0])
+        return server, port
+    except: return None, None
+
+def tcp_check(host, port):
+    if not isinstance(host, str) or not host or not port or not 1 <= port <= 65535 or "%" in host:
+        return False, 0
+    try:
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        for family, kind, proto, _, endpoint in addresses:
+            address = ipaddress.ip_address(endpoint[0])
+            if not address.is_global or address.is_multicast:
+                continue
+            if address.version == 6 and (address not in ipaddress.ip_network("2000::/3") or address.sixtofour or address.teredo):
+                continue
             try:
-                control.send_message(OWNER, f"ارسال برنامه #{key} تأیید نشد؛ کانال و دسترسی ربات را بررسی کن. برنامه متوقف شد.")
-            except Exception:
-                log.warning("Could not notify owner")
+                with socket.socket(family, kind, proto) as conn:
+                    conn.settimeout(CONNECT_TIMEOUT)
+                    started = time.monotonic()
+                    conn.connect(endpoint)
+                    return True, round((time.monotonic() - started) * 1000)
+            except OSError:
+                continue
+    except (OSError, ValueError, UnicodeError):
+        pass
+    return False, 0
+
+def is_alive_and_ping(uri):
+    host, port = parse_host_port(uri)
+    return (*tcp_check(host, port), host)
+
+def is_proxy_alive(proxy_url):
+    return (*tcp_check(*parse_proxy_host_port(proxy_url)), proxy_url)
+
+
+def rename_config_uri(uri, flag, channel_id):
+    NEW_NAME = f"{flag} {channel_id} | کانفیگ روزانه"
+    try:
+        scheme, rest = uri.split("://", 1)
+        if scheme == "vmess":
+            pad = rest.split("#", 1)[0]
+            pad += "=" * (-len(pad) % 4)
+            j = json.loads(base64.urlsafe_b64decode(pad.encode()).decode("utf-8", errors="ignore"))
+            j["ps"] = NEW_NAME
+            encoded = base64.urlsafe_b64encode(json.dumps(j, ensure_ascii=False).encode("utf-8")).decode("utf-8").rstrip("=")
+            return f"vmess://{encoded}"
         else:
-            def finish(data):
-                current = data["jobs"].get(key)
-                if not current:
-                    return
-                if job["clock"]:
-                    current.update(due=next_daily(job["clock"], time.time()), status="ready")
-                else:
-                    del data["jobs"][key]
-            store.change(finish)
+            if "#" in rest: rest = rest.split("#", 1)[0]
+            frag = urllib.parse.quote(NEW_NAME, safe="")
+            return f"{scheme}://{rest}#{frag}"
+    except Exception:
+        return uri
+
+def build_pack_post(valid_items, ch_info):
+    header = ch_info["header"]
+    footer = ch_info["footer"]
+    ch_id = BRAND
+    body = ""
+    used_keys = []
+    
+    for idx, (c_key, flag, country, ping_ms, raw_uri) in enumerate(valid_items):
+        renamed_uri = rename_config_uri(raw_uri, flag, ch_id)
+        num_emoji = NUM_EMOJIS[idx] if idx < len(NUM_EMOJIS) else f"{idx+1}."
+        block = f"{num_emoji} 🌐 {flag} ({country}) | TCP: {ping_ms}ms\n"
+        block += f"<pre>{html.escape(renamed_uri)}</pre>\n\n"
+        
+        if len(header) + len(body) + len(block) + len(footer) <= MAX_MESSAGE_LENGTH:
+            body += block
+            used_keys.append(c_key)
+        else:
+            continue
+            
+    if not used_keys:
+        return None, []
+        
+    return header + body + footer, used_keys
+
+def build_keyboard(proxies_list, channel_url):
+    markup = InlineKeyboardMarkup()
+    p_buttons = []
+    for i, (p_url, p_ping) in enumerate(proxies_list[:3]):
+        label = PERSIAN_NUMS[i] if i < len(PERSIAN_NUMS) else str(i+1)
+        p_buttons.append(InlineKeyboardButton(text=f"⚡ پروکسی {label} ({p_ping}ms)", url=p_url))
+        
+    if channel_url:
+        p_buttons.append(InlineKeyboardButton(text="📢 کانال زیرولاست", url=channel_url))
+    for offset in range(0, len(p_buttons), 2):
+        markup.row(*p_buttons[offset:offset+2])
+    return markup if p_buttons else None
 
 
-def schedule_loop(store, publisher, control):
+def collect_telegram():
+    pool = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for res in ex.map(fetch_telegram, TG_SOURCES):
+            if res: pool += res
+    return list(dict.fromkeys(pool))
+
+def collect_github():
+    pool = []
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        for res in ex.map(fetch_github, GITHUB_SOURCES):
+            if res: pool += res
+    return list(dict.fromkeys(pool))
+
+def collect_valid_proxies(seen, now, max_needed=6):
+    pool = []
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for res in ex.map(fetch_telegram_proxies, PROXY_TG_SOURCES):
+            if res: pool += res
+        for res in ex.map(fetch_github_proxies, PROXY_GH_SOURCES):
+            if res: pool += res
+    pool = list(dict.fromkeys(pool))
+    random.shuffle(pool)
+    
+    fresh_cands = [p for p in pool if now - seen.get(p, 0) > RECYCLE_HOURS * 3600]
+    old_cands = [p for p in pool if now - seen.get(p, 0) <= RECYCLE_HOURS * 3600]
+    
+    valid_proxies = []
+    for cands in [fresh_cands, old_cands]:
+        if len(valid_proxies) >= max_needed: break
+        if not cands: continue
+        
+        with ThreadPoolExecutor(max_workers=30) as ex:
+            for i in range(0, len(cands), 30):
+                batch = cands[i:i+30]
+                results = list(ex.map(is_proxy_alive, batch))
+                for ok, ping_ms, p_url in results:
+                    if ok:
+                        valid_proxies.append((p_url, ping_ms))
+                        if len(valid_proxies) >= max_needed: break
+                if len(valid_proxies) >= max_needed: break
+                
+    return valid_proxies
+
+def process_candidates(candidates, valid_items, max_needed):
+    seen_in_batch = {item[0] for item in valid_items}
+    with ThreadPoolExecutor(max_workers=50) as ex:
+        for i in range(0, len(candidates), 30):
+            batch = candidates[i:i+30]
+            results = list(ex.map(is_alive_and_ping, batch))
+            
+            for cfg, (ok, ping_ms, host) in zip(batch, results):
+                if ok:
+                    c_key = config_key(cfg)
+                    if c_key in seen_in_batch:
+                        continue
+                    country, flag = "اتصال TCP", "🌐"
+                    test_uri = rename_config_uri(cfg, flag, BRAND)
+                    if len(test_uri) <= 700:
+                        valid_items.append((c_key, flag, country, ping_ms, cfg))
+                        seen_in_batch.add(c_key)
+                    
+                    if len(valid_items) >= max_needed: break
+            if len(valid_items) >= max_needed: break
+    return valid_items
+
+if __name__ == "__main__":
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN before starting Zero Lost.")
+    bot = telebot.TeleBot(token, threaded=False)
+    CHANNELS = [channel_settings()]
+    DATA_DIR.mkdir(mode=0o700, exist_ok=True)
+    log.info("Zero Lost started")
     while True:
         try:
-            tick(store, publisher, control)
-        except Exception as error:
-            log.error("Scheduler error (%s)", type(error).__name__)
-        time.sleep(2)
+            seen = load_seen()
+            now = time.time()
+            valid_items = []
+            
+            # --- مرحله اول: جستجوی کانفیگ در تلگرام ---
+            log.info("Collecting configs from Telegram...")
+            tg_cfgs = collect_telegram()
+            random.shuffle(tg_cfgs)
+            tg_candidates = [c for c in tg_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
+            
+            valid_items = process_candidates(tg_candidates, valid_items, TARGET_CONFIGS)
+            
+            # --- مرحله دوم: تکمیل ظرفیت کانفیگ از گیت‌هاب و لینک‌های ساب ---
+            if len(valid_items) < TARGET_CONFIGS:
+                needed = TARGET_CONFIGS - len(valid_items)
+                log.info(f"Need {needed} more configs. Fetching from GitHub...")
+                gh_cfgs = collect_github()
+                random.shuffle(gh_cfgs)
+                gh_candidates = [c for c in gh_cfgs if now - seen.get(config_key(c), 0) > RECYCLE_HOURS * 3600]
+                
+                valid_items = process_candidates(gh_candidates, valid_items, TARGET_CONFIGS)
+
+            # --- مرحله سوم: جمع‌آوری و تست پروکسی‌های تلگرام ---
+            log.info("Collecting MTProto proxies...")
+            valid_proxies = collect_valid_proxies(seen, now, TARGET_PROXIES)
+
+            # --- ساخت و ارسال ۲ پست (با فاصله ۵ تا ۱۰ ثانیه) ---
+            if valid_items:
+                packs = [
+                    (valid_items[:8], valid_proxies[:3]),
+                    (valid_items[8:16], valid_proxies[3:6])
+                ]
+                
+                for ch in CHANNELS:
+                    sent_count = 0
+                    for p_idx, (pack_cfgs, pack_proxies) in enumerate(packs):
+                        if not pack_cfgs:
+                            continue
+                        if p_idx > 0 and sent_count > 0:
+                            gap = random.uniform(5, 10)
+                            log.info(f"Waiting {gap:.1f}s before sending 2nd post to {ch['id']}...")
+                            time.sleep(gap)
+                            
+                        post_text, used_keys = build_pack_post(pack_cfgs, ch)
+                        if post_text and used_keys:
+                            try:
+                                keyboard = build_keyboard(pack_proxies, ch["url"])
+                                bot.send_message(
+                                    ch["id"], 
+                                    post_text, 
+                                    parse_mode="HTML", 
+                                    disable_web_page_preview=True,
+                                    reply_markup=keyboard
+                                )
+                                sent_count += 1
+                                for key in [*used_keys, *(url for url, _ in pack_proxies)]:
+                                    seen[key] = time.time()
+                                log.info(f"Sent post #{p_idx+1} to {ch['id']} ({len(used_keys)} configs, {len(pack_proxies)} proxies)")
+                            except Exception as e:
+                                log.error("Telegram send failed (%s)", type(e).__name__)
+                            else:
+                                save_seen(seen)
+                    time.sleep(2)
+                
 
 
-def attach(control, store):
-    state = {}
-
-    def show(text, buttons=(), home=True):
-        markup = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-        if buttons:
-            markup.add(*buttons)
-        if home:
-            markup.row(HOME)
-        control.send_message(OWNER, text, reply_markup=markup, disable_web_page_preview=True)
-
-    def menu(text="پنل مدیریت زیرولاست"):
-        state.clear()
-        show(text, [INTERVAL, TARGETS, SOURCES, TEMPLATE, SCHEDULE, JOBS], False)
-
-    def prompt(step, text, buttons=()):
-        state["step"] = step
-        show(text, buttons)
-
-    def handle(message):
-        text = (message.text or "").strip()
-        step = state.get("step")
-        if message.content_type == "photo" and step != "body":
-            return control.send_message(OWNER, "عکس را بعد از انتخاب «پیام جدید» و کانال مقصد بفرست.")
-        data = store.snapshot()
-        if text in (HOME, "/panel", "/start", "/cancel"):
-            return menu()
-        if not step:
-            if text == INTERVAL:
-                return prompt("minutes", f"فاصله فعلی: {data['minutes']} دقیقه. انتخاب کن یا عدد ۱ تا ۱۴۴۰ بفرست.", ["10", "15", "20", "30", "60"])
-            if text in (TARGETS, SOURCES):
-                field = "targets" if text == TARGETS else "sources"
-                state["field"] = field
-                return prompt("list", text + ":\n" + "\n".join(data[field]), [ADD, REMOVE])
-            if text == TEMPLATE:
-                return prompt("field", "بخش مورد نظر را انتخاب کن.", list(FIELDS))
-            if text == SCHEDULE:
-                return prompt("target", "پیام به کدام کانال برود؟", data["targets"])
-            if text == JOBS:
-                jobs = data["jobs"]
-                if not jobs:
-                    return menu("هیچ برنامه‌ای ثبت نشده.")
-                lines = []
-                for key, job in jobs.items():
-                    status = {"ready": "فعال", "sending": "ارسال نامشخص", "failed": "ناموفق"}[job["status"]]
-                    repeat = "روزانه" if job["clock"] else "یک‌بار"
-                    label = "📷 " if job.get("photo") else ""
-                    lines.append(f"#{key} · {job['target']} · {repeat} · {display_time(job['due'])} · {status}\n{label}{job['body'][:32]}")
-                return prompt("delete_job", "\n".join(lines) + "\nبرای حذف، شمارهٔ برنامه را انتخاب کن.", list(jobs))
-            return menu()
-        if step == "minutes":
-            if not text.isdecimal() or len(text) > 4 or not 1 <= int(text) <= 1440:
-                raise ValueError("عدد بین ۱ و ۱۴۴۰ بفرست.")
-            store.change(lambda settings: settings.update(minutes=int(text)))
-            return menu(f"فاصلهٔ پست‌های کانفیگ: {int(text)} دقیقه.")
-        if step == "list":
-            if text not in (ADD, REMOVE):
-                raise ValueError("افزودن یا حذف را انتخاب کن.")
-            state["adding"] = text == ADD
-            return prompt("entry", "نام کانال را بفرست. حذف مقصد، برنامه‌های همان مقصد را هم لغو می‌کند.", [] if text == ADD else data[state["field"]])
-        if step == "entry":
-            field = state["field"]
-            value = text.removeprefix("https://t.me/").lstrip("@")
-            numeric = bool(re.fullmatch(r"-100[0-9]+", value)) and field == "targets"
-            if not numeric and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", value):
-                raise ValueError("نام کاربری عمومی کانال یا شناسهٔ عددی مقصد را وارد کن.")
-            if field == "targets" and not numeric:
-                value = "@" + value
-            existing = next((item for item in data[field] if item.lower() == value.lower()), None)
-            if state["adding"]:
-                if existing or len(data[field]) >= 60:
-                    raise ValueError("تکراری است یا فهرست پر شده.")
-                store.change(lambda settings: settings[field].append(value))
-            else:
-                if not existing or (field == "targets" and len(data[field]) == 1):
-                    raise ValueError("مورد پیدا نشد یا آخرین مقصد است.")
-                def remove(settings):
-                    settings[field].remove(existing)
-                    if field == "targets":
-                        settings["jobs"] = {key: job for key, job in settings["jobs"].items() if job["target"] != existing}
-                store.change(remove)
-            return menu("فهرست ذخیره شد.")
-        if step == "field":
-            if text not in FIELDS:
-                raise ValueError("یکی از بخش‌ها را انتخاب کن.")
-            state["field"] = FIELDS[text]
-            return prompt("value", "مقدار فعلی: " + (data["fields"][FIELDS[text]] or "خالی") + "\nمقدار جدید را بفرست یا این بخش را پاک کن.", [CLEAR])
-        if step == "value":
-            field = state["field"]
-            value = "" if text == CLEAR else text
-            if field in ("main", "vip", "bot") and value:
-                if value.startswith("@"):
-                    value = "https://t.me/" + value[1:]
-                if not re.fullmatch(r"https://t\.me/(?:[A-Za-z][A-Za-z0-9_]{3,31}|\+[\w-]{4,100})", value):
-                    raise ValueError("لینک https://t.me/... یا @username بفرست.")
-            if len(html.escape(value)) > (150 if field == "title" else 700):
-                raise ValueError("متن طولانی است؛ کوتاه‌تر بفرست.")
-            store.change(lambda settings: settings["fields"].update({field: value}))
-            return menu("قالب پست‌های بعدی ذخیره شد.")
-        if step == "target":
-            if text not in data["targets"]:
-                raise ValueError("یکی از مقصدهای فهرست را انتخاب کن.")
-            state["target"] = text
-            return prompt("body", "متن یا یک عکس بفرست. اگر کپشن می‌خواهی، موقع ارسال عکس زیرش بنویس.")
-        if step == "body":
-            if message.content_type == "photo":
-                if message.media_group_id:
-                    raise ValueError("فقط یک عکس بفرست، نه آلبوم.")
-                text = message.caption or ""
-                if len(text) > 1024:
-                    raise ValueError("کپشن طولانی است؛ عکس را با کپشن کوتاه‌تر بفرست.")
-                state["photo"] = max(message.photo, key=lambda size: size.width * size.height).file_id
-            elif not text or len(text.encode("utf-16-le")) // 2 > 4000:
-                raise ValueError("متن باید بین ۱ تا ۴۰۰۰ کاراکتر باشد.")
-            state["body"] = text
-            return prompt("mode", "چه زمانی فرستاده شود؟", [NOW, LATER, DAILY])
-        if step == "mode":
-            if text not in (NOW, LATER, DAILY):
-                raise ValueError("یکی از سه حالت را انتخاب کن.")
-            state.update(mode=text, clock="", delay=0)
-            if text == LATER:
-                return prompt("delay", "چقدر دیگر؟ مثلاً «3 ساعت» یا «15 دقیقه».")
-            if text == DAILY:
-                return prompt("clock", "ساعت تهران را ۲۴ ساعته بنویس؛ مثلاً 21:30.")
-        elif step == "delay":
-            match = re.fullmatch(r"(\d{1,5})\s*(ساعت|دقیقه)", text)
-            if not match or not int(match[1]):
-                raise ValueError("مثال: ۲ ساعت یا ۳۰ دقیقه")
-            state["delay"] = int(match[1]) * (3600 if match[2] == "ساعت" else 60)
-        elif step == "clock":
-            match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
-            if not match or int(match[1]) > 23 or int(match[2]) > 59:
-                raise ValueError("ساعت معتبر مثل 09:05 بفرست.")
-            state["clock"] = f"{int(match[1]):02d}:{int(match[2]):02d}"
-        elif step == "confirm":
-            if text != CONFIRM:
-                raise ValueError("برای ثبت، دکمهٔ تأیید را بزن یا به منو برگرد.")
-            def add(settings):
-                if len(settings["jobs"]) >= 30 or state["target"] not in settings["targets"]:
-                    raise ValueError("فهرست برنامه‌ها پر است یا مقصد حذف شده.")
-                key = str(settings["next_id"])
-                settings["next_id"] += 1
-                now = time.time()
-                due = next_daily(state["clock"], now) if state["clock"] else now + state["delay"]
-                settings["jobs"][key] = dict(target=state["target"], body=state["body"], due=due, clock=state["clock"], status="ready")
-                if "photo" in state:
-                    settings["jobs"][key]["photo"] = state["photo"]
-                return key
-            return menu("برنامه ثبت شد: #" + store.change(add))
-        elif step == "delete_job":
-            if text not in data["jobs"]:
-                raise ValueError("شمارهٔ یک برنامهٔ موجود را انتخاب کن.")
-            state["key"] = text
-            return prompt("confirm_delete", f"برنامه #{text} لغو شود؟", ["بله، لغو کن"])
-        elif step == "confirm_delete":
-            if text != "بله، لغو کن":
-                raise ValueError("لغو را تأیید کن یا به منو برگرد.")
-            store.change(lambda settings: settings["jobs"].pop(state["key"], None))
-            return menu("برنامه لغو شد.")
-        when = state["clock"] or (f"{state['delay']//60} دقیقه بعد از تأیید" if state["delay"] else "بعد از تأیید")
-        label = "📷 عکس\n" if "photo" in state else ""
-        return prompt("confirm", f"مقصد: {state['target']}\n{state['mode']} · {when} (تهران)\n\n{label}{state['body'][:500]}\n\nثبت شود؟", [CONFIRM])
-
-    @control.message_handler(func=lambda message: message.chat.type == "private" and message.from_user is not None and message.from_user.id == OWNER and message.chat.id == OWNER, content_types=["text", "photo"])
-    def owner_message(message):
-        try:
-            handle(message)
-        except ValueError as error:
-            control.send_message(OWNER, str(error))
+            log.info("Waiting 10 minutes...")
+            time.sleep(600) 
+            
+        except Exception as e:
+            log.error("Round failed (%s)", type(e).__name__)
+            time.sleep(60)
