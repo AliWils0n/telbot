@@ -8,7 +8,7 @@ from panel import Store, attach, channel_id, schedule_loop, template
 import requests, telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-BRAND = "Zero Lost | زیرولاست"
+BRAND = "@zirolost | زیرولاست"
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("STATE_DIRECTORY") or BASE_DIR / "data")
 SEEN_FILE = DATA_DIR / "seen.json"
